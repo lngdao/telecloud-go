@@ -44,14 +44,22 @@ var (
 	startMu         sync.Mutex
 )
 
-func staggerUpload(ctx context.Context) {
+func staggerUpload(ctx context.Context, fileSize int64) {
 	startMu.Lock()
 	now := time.Now()
 	if nextUploadStart.Before(now) {
 		nextUploadStart = now
 	}
 	wait := nextUploadStart.Sub(now)
-	nextUploadStart = nextUploadStart.Add(500 * time.Millisecond)
+
+	staggerDur := 500 * time.Millisecond
+	if fileSize > 0 && fileSize < 5*1024*1024 {
+		staggerDur = 50 * time.Millisecond
+	} else if fileSize > 0 && fileSize < 50*1024*1024 {
+		staggerDur = 200 * time.Millisecond
+	}
+
+	nextUploadStart = nextUploadStart.Add(staggerDur)
 	startMu.Unlock()
 
 	if wait > 0 {
@@ -710,7 +718,7 @@ func ProcessCompleteUpload(ctx context.Context, filePath, filename, path, mimeTy
 	// Wait for a slot in the upload queue
 	select {
 	case uploadSemaphore <- struct{}{}:
-		staggerUpload(ctx)
+		staggerUpload(ctx, fileSize)
 		defer func() { <-uploadSemaphore }()
 	case <-ctx.Done():
 		UpdateTaskWithFile(taskID, "error", 0, "upload_cancelled_waiting", filename, owner, fileSize, 0)
@@ -857,12 +865,14 @@ func ProcessCompleteUpload(ctx context.Context, filePath, filename, path, mimeTy
 
 	success = true
 
-	localThumb := utils.CreateLocalThumbnail(filePath, mimeType, cfg.FFMPEGPath)
-	if localThumb != nil {
-		database.DB.Exec("UPDATE files SET thumb_path = ? WHERE id = ?", *localThumb, fileID)
-	}
-
 	UpdateTaskWithFileID(taskID, "done", 100, "", fileID, uniqueFilename, owner)
+
+	go func() {
+		localThumb := utils.CreateLocalThumbnail(filePath, mimeType, cfg.FFMPEGPath)
+		if localThumb != nil {
+			database.DB.Exec("UPDATE files SET thumb_path = ? WHERE id = ?", *localThumb, fileID)
+		}
+	}()
 
 	select {
 	case <-time.After(1000 * time.Millisecond):
@@ -1038,7 +1048,7 @@ func ProcessRemoteUpload(ctx context.Context, url, path, taskID string, cfg *con
 	// Wait for a slot in the upload queue
 	select {
 	case uploadSemaphore <- struct{}{}:
-		staggerUpload(ctx)
+		staggerUpload(ctx, size)
 		defer func() { <-uploadSemaphore }()
 	case <-ctx.Done():
 		UpdateTaskWithFile(taskID, "error", 0, "upload_cancelled_waiting", filename, owner, size, 0)
@@ -1305,10 +1315,15 @@ func ProcessCompleteUploadSync(ctx context.Context, filePath, filename, path, mi
 
 	database.EnsureFoldersExist(path, owner)
 
+	var syncFileSize int64
+	if stat, err := os.Stat(filePath); err == nil {
+		syncFileSize = stat.Size()
+	}
+
 	// Wait for a slot in the upload queue
 	select {
 	case uploadSemaphore <- struct{}{}:
-		staggerUpload(ctx)
+		staggerUpload(ctx, syncFileSize)
 		defer func() { <-uploadSemaphore }()
 	case <-ctx.Done():
 		return 0, "", fmt.Errorf("upload cancelled while waiting for queue")
@@ -1688,7 +1703,7 @@ func ProcessRemoteUploadSync(ctx context.Context, url, path, taskID string, cfg 
 	// Wait for a slot in the upload queue
 	select {
 	case uploadSemaphore <- struct{}{}:
-		staggerUpload(ctx)
+		staggerUpload(ctx, size)
 		defer func() { <-uploadSemaphore }()
 	case <-ctx.Done():
 		return 0, "", fmt.Errorf("cancelled while waiting for upload slot")
